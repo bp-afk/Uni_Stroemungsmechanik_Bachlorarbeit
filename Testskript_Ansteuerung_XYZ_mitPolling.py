@@ -26,26 +26,60 @@ def daq_voltage():
     # Mittelstellung: 12 Bit => Wertebereich -2047.5 ... +2047.5
     return (adc_value - 2047.5) * (5/2047.5)
 
+class UsbDatalogger:
+    def __init__(self, board_num=0, channel=0, ul_range=ULRange.BIP5VOLTS):
+        self.board_num = board_num
+        self.channel = channel
+        self.ul_range = ul_range
+
+    def read_raw(self):
+        return ul.a_in(self.board_num, self.channel, self.ul_range)
+
+    def raw_to_voltage(self, adc_value, n_bits=12, v_range=5):
+        max_adc = (2 ** n_bits) - 1
+        return (adc_value - (max_adc / 2)) * (v_range / (max_adc / 2))
+
+    def read_once(self):
+        raw = self.read_raw()
+        voltage = self.raw_to_voltage(raw)
+        return raw, voltage
+
+    def read_burst(self, samples=8, delay_s=0.01):
+        vals = []
+        for _ in range(max(1, samples)):
+            _, voltage = self.read_once()
+            vals.append(voltage)
+            if delay_s > 0:
+                time.sleep(delay_s)
+        return float(np.mean(vals))
+
+    def close(self):
+        pass
+
 class MotorController:
     def __init__(self, port, baud):
         self.ser = serial.Serial(port, baud, timeout=1)
         self.lock = threading.Lock()
         self.queue = queue.Queue()
+        self.stop_event = threading.Event()
         threading.Thread(target=self.reader_thread, daemon=True).start()
 
     def send(self, cmd):
         with self.lock:
+            if not self.ser.is_open:
+                return
             self.ser.write((cmd + '\n').encode())
             time.sleep(0.01)
 
     def reader_thread(self):
-        while True:
+        while not self.stop_event.is_set():
             try:
                 msg = self.ser.readline().decode(errors="ignore").strip()
                 if msg.startswith("POS"):
                     self.queue.put(msg)
             except Exception:
-                pass
+                if self.stop_event.is_set():
+                    break
 
     def get_pos(self):
         last = None
@@ -56,10 +90,18 @@ class MotorController:
             return int(parts[1]), int(parts[2])
         return None, None
 
+    def close(self):
+        self.stop_event.set()
+        try:
+            if self.ser.is_open:
+                self.ser.close()
+        except Exception:
+            pass
+
 class ToggleButton(ttk.Button):
-    def __init__(self, master, text_on, text_off, command=None, *args, **kwargs):
+    def __init__(self, master, text_on, text_off, command=None, initial_state=False, *args, **kwargs):
         super().__init__(master, text=text_on, *args, **kwargs)
-        self.state = True  # True = gehalten/ENABLE, False = stromlos/IDLE
+        self.state = initial_state  # True = gehalten/ENABLE, False = stromlos/IDLE
         self.text_on = text_on
         self.text_off = text_off
         self.command = command
@@ -108,15 +150,24 @@ class MeasurementGUI(tk.Tk):
         self.save_dir = tk.StringVar(value=os.getcwd())
 
         self.mot = MotorController(ARDUINO_PORT, BAUD)
+        self.datalogger = UsbDatalogger(board_num=DAQ_BOARD, channel=DAQ_CH, ul_range=ULRange.BIP5VOLTS)
         self.data = []
+        self.data_lock = threading.Lock()
         self.automatik_stop = threading.Event()
         self.measure_thread = None
+        self.logger_thread = None
+        self.logger_stop = threading.Event()
+        self.log_interval_s = 0.1
+        self.move_in_progress = False
+        self.target_lock = threading.Lock()
+        self.current_target = (self.start_x.get(), self.start_y.get(), self.z_pos.get())
 
         self.moving_x = False
         self.moving_y = False
         self.automatik_running = False
 
         self.build_gui()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def build_gui(self):
         left = ttk.Frame(self); left.pack(side=tk.LEFT, fill="y")
@@ -150,9 +201,9 @@ class MeasurementGUI(tk.Tk):
         # Motoren-Buttons
         motorlf = ttk.LabelFrame(left, text="Motoren (stromlos/halten)")
         motorlf.pack(padx=5,pady=5,fill="x")
-        self.tog_x = ToggleButton(motorlf, "X ist stromlos", "X wird gehalten", command=self.update_mot_x)
+        self.tog_x = ToggleButton(motorlf, "X wird gehalten", "X ist stromlos", command=self.update_mot_x, initial_state=False)
         self.tog_x.pack(fill="x",pady=1)
-        self.tog_y = ToggleButton(motorlf, "Y ist stromlos", "Y wird gehalten", command=self.update_mot_y)
+        self.tog_y = ToggleButton(motorlf, "Y wird gehalten", "Y ist stromlos", command=self.update_mot_y, initial_state=False)
         self.tog_y.pack(fill="x",pady=1)
 
         # Manuelle Pfeilsteuerung
@@ -180,6 +231,30 @@ class MeasurementGUI(tk.Tk):
     def choose_dir(self):
         newdir = filedialog.askdirectory()
         if newdir: self.save_dir.set(newdir)
+
+    def _ui_call(self, fn, *args, **kwargs):
+        if threading.current_thread() is threading.main_thread():
+            fn(*args, **kwargs)
+        else:
+            self.after(0, lambda: fn(*args, **kwargs))
+
+    def _set_status(self, text):
+        self._ui_call(self.status.set, text)
+
+    def _set_toggle_enabled(self, enabled):
+        self._ui_call(self.tog_x.set_disabled, not enabled)
+        self._ui_call(self.tog_y.set_disabled, not enabled)
+
+    def apply_motion_settings(self):
+        spd = int(self.speed.get())
+        acc = int(self.accel.get())
+        for axis in ("X", "Y"):
+            self.mot.send(f"SPEED {axis} {spd}")
+            self.mot.send(f"ACCEL {axis} {acc}")
+
+    def _set_target(self, x, y, z):
+        with self.target_lock:
+            self.current_target = (x, y, z)
 
     # Update Motorstatus mit ToggleButton
     def update_mot_x(self, enabled):
@@ -230,6 +305,7 @@ class MeasurementGUI(tk.Tk):
                 self.mot.send("ENABLE Y")
 
     def _move_hold(self, axis, sign):
+        self.apply_motion_settings()
         step = int(sign * float(self.step_size.get()) * float(self.pulses_per_rev.get()) / float(self.mm_per_rev.get()))
         while (self.moving_x if axis=="x" else self.moving_y):
             # Immer nur schicken, wenn auf "halten"
@@ -251,34 +327,65 @@ class MeasurementGUI(tk.Tk):
         self.data.clear()
         self.listbox.delete(0, tk.END)
         self.automatik_stop.clear()
+        self.logger_stop.clear()
         self.automatik_running = True
+        self.apply_motion_settings()
         self.measure_thread = threading.Thread(target=self.automatik, daemon=True)
         self.measure_thread.start()
 
     def abort_automatik(self):
         self.automatik_stop.set()
-        self.status.set("Automatik abgebrochen!")
+        self.logger_stop.set()
+        self._set_status("Automatik abgebrochen!")
         self.automatik_running = False
-        self.tog_x.set_disabled(False)
-        self.tog_y.set_disabled(False)
+        self._set_toggle_enabled(True)
 
-    def goto_pos(self, x, y):
+    def goto_pos(self, x, y, timeout_s=60, poll_s=0.05):
         s_x = int(x * float(self.pulses_per_rev.get()) / float(self.mm_per_rev.get()))
         s_y = int(y * float(self.pulses_per_rev.get()) / float(self.mm_per_rev.get()))
+        self._set_target(x, y, self.z_pos.get())
         self.mot.send(f"ENABLE X"); self.mot.send(f"ENABLE Y")
         self.mot.send(f"GOTO X {s_x}"); self.mot.send(f"GOTO Y {s_y}")
-        time.sleep(0.15)
-        for _ in range(100):
+        self.move_in_progress = True
+        t_end = time.time() + timeout_s
+        while time.time() < t_end:
+            self.mot.send("POS?")
             act_x, act_y = self.mot.get_pos()
             if act_x is not None and abs(act_x-s_x)<3 and abs(act_y-s_y)<3:
-                break
+                self.move_in_progress = False
+                return True
             if self.automatik_stop.is_set(): 
-                self.tog_x.set_disabled(False)
-                self.tog_y.set_disabled(False)
-                return
+                self.move_in_progress = False
+                return False
+            time.sleep(poll_s)
+        self.move_in_progress = False
+        self._set_status("Warnung: Zielposition nicht bestätigt (Timeout).")
+        return False
+
+    def _start_continuous_logger(self):
+        if self.logger_thread is not None and self.logger_thread.is_alive():
+            return
+        self.logger_stop.clear()
+        self.logger_thread = threading.Thread(target=self._continuous_logger_worker, daemon=True)
+        self.logger_thread.start()
+
+    def _stop_continuous_logger(self):
+        self.logger_stop.set()
+        if self.logger_thread is not None and self.logger_thread.is_alive():
+            self.logger_thread.join(timeout=1.0)
+
+    def _continuous_logger_worker(self):
+        while not self.logger_stop.is_set() and not self.automatik_stop.is_set():
+            if not self.move_in_progress:
+                time.sleep(0.02)
+                continue
+            with self.target_lock:
+                x, y, z = self.current_target
+            self._add_measurement_row(x, y, z, burst=False)
+            time.sleep(self.log_interval_s)
 
     def automatik(self):
-        self.status.set("Automatik aktiv.")
+        self._set_status("Automatik aktiv.")
         ablauf = self.ablaufart.get()
         modus = self.messmodus.get()
         stepx = float(self.step_size.get())
@@ -286,89 +393,105 @@ class MeasurementGUI(tk.Tk):
         xmin, xmax = 10, self.x_max.get()
         ymin, ymax = 10, self.y_max.get()
         z = self.z_pos.get()
-        self.goto_pos(self.start_x.get(), self.start_y.get())
-        time.sleep(0.2)
-        if ablauf=="KREUZ":
-            ym = (ymin + ymax)/2
-            xlist = np.arange(xmin,xmax+0.01,stepx)
-            for x in xlist:
-                self.goto_pos(x, ym)
-                if modus == "PUNKTE":
-                    self._messpunkt(x,ym,z)
-                elif modus == "KONTI":
-                    self._mess_kontinuierlich(x,ym,z,richtung="x")
-                if self.automatik_stop.is_set():
-                    self.automatik_running = False
-                    self.tog_x.set_disabled(False)
-                    self.tog_y.set_disabled(False)
-                    return
-            xm = (xmin + xmax)/2
-            ylist = np.arange(ymin, ymax+0.01, stepy)
-            for y in ylist:
-                self.goto_pos(xm, y)
-                if modus == "PUNKTE":
-                    self._messpunkt(xm,y,z)
-                elif modus == "KONTI":
-                    self._mess_kontinuierlich(xm,y,z,richtung="y")
-                if self.automatik_stop.is_set():
-                    self.automatik_running = False
-                    self.tog_x.set_disabled(False)
-                    self.tog_y.set_disabled(False)
-                    return
-        elif ablauf=="SCHLANGE":
-            ylist = np.arange(ymin, ymax+0.01, stepy)
-            xlist = np.arange(xmin, xmax+0.01, stepx)
-            reverse = False
-            for yi, y in enumerate(ylist):
-                xrow = xlist if not reverse else xlist[::-1]
-                for x in xrow:
-                    self.goto_pos(x, y)
+        try:
+            if modus == "KONTI":
+                self._start_continuous_logger()
+            self.goto_pos(self.start_x.get(), self.start_y.get())
+            time.sleep(0.2)
+            if ablauf=="KREUZ":
+                ym = (ymin + ymax)/2
+                xlist = np.arange(xmin,xmax+0.01,stepx)
+                for x in xlist:
+                    self.goto_pos(x, ym)
                     if modus == "PUNKTE":
-                        self._messpunkt(x,y,z)
-                    elif modus == "KONTI":
-                        self._mess_kontinuierlich(x,y,z,richtung="x")
+                        self._messpunkt(x,ym,z)
                     if self.automatik_stop.is_set():
-                        self.automatik_running = False
-                        self.tog_x.set_disabled(False)
-                        self.tog_y.set_disabled(False)
                         return
-                reverse = not reverse
-        self.status.set("Messlauf abgeschlossen.")
-        self.tog_x.set_disabled(False)
-        self.tog_y.set_disabled(False)
-        self.automatik_running = False
+                xm = (xmin + xmax)/2
+                ylist = np.arange(ymin, ymax+0.01, stepy)
+                for y in ylist:
+                    self.goto_pos(xm, y)
+                    if modus == "PUNKTE":
+                        self._messpunkt(xm,y,z)
+                    if self.automatik_stop.is_set():
+                        return
+            elif ablauf=="SCHLANGE":
+                ylist = np.arange(ymin, ymax+0.01, stepy)
+                xlist = np.arange(xmin, xmax+0.01, stepx)
+                reverse = False
+                for y in ylist:
+                    xrow = xlist if not reverse else xlist[::-1]
+                    for x in xrow:
+                        self.goto_pos(x, y)
+                        if modus == "PUNKTE":
+                            self._messpunkt(x,y,z)
+                        if self.automatik_stop.is_set():
+                            return
+                    reverse = not reverse
+            if not self.automatik_stop.is_set():
+                self._set_status("Messlauf abgeschlossen.")
+        finally:
+            self.move_in_progress = False
+            self._stop_continuous_logger()
+            self._set_toggle_enabled(True)
+            self.automatik_running = False
 
     def _messpunkt(self, x, y, z):
-        voltage = daq_voltage()
-        airflow = voltage_to_airflow(voltage)
-        row = {'x':x, 'y':y, 'z':z, 'voltage':voltage, 'airflow':airflow}
-        self.data.append(row)
-        self._display_row(row)
-        return voltage
+        self._add_measurement_row(x, y, z, burst=True)
 
-    def _mess_kontinuierlich(self, x, y, z, richtung="x"):
-        for _ in range(10):
-            if self.automatik_stop.is_set(): break
+    def _add_measurement_row(self, x, y, z, burst):
+        try:
             voltage = daq_voltage()
             airflow = voltage_to_airflow(voltage)
-            row = {'x':x, 'y':y, 'z':z, 'voltage':voltage, 'airflow':airflow}
-            self.data.append(row)
+            if burst:
+                dl_mean = self.datalogger.read_burst(samples=8, delay_s=0.01)
+                dl_raw, dl_voltage = self.datalogger.read_once()
+            else:
+                dl_raw, dl_voltage = self.datalogger.read_once()
+                dl_mean = dl_voltage
+            row = {
+                'x':x, 'y':y, 'z':z,
+                'voltage':voltage, 'airflow':airflow,
+                'dl_raw':dl_raw, 'dl_voltage':dl_voltage, 'dl_mean':dl_mean
+            }
+            with self.data_lock:
+                self.data.append(row)
             self._display_row(row)
-            time.sleep(0.1)
+            return row
+        except Exception as exc:
+            self._set_status(f"Datalogger/DAQ Fehler: {exc}")
+            return None
 
     def _display_row(self, row):
-        self.listbox.insert(tk.END, f"x={row['x']:.1f} y={row['y']:.1f} z={row['z']:.1f} U={row['voltage']:+.4f}V w={row['airflow']:+.2f}m/s")
-        self.listbox.yview_moveto(1)
+        def _insert():
+            self.listbox.insert(
+                tk.END,
+                f"x={row['x']:.1f} y={row['y']:.1f} z={row['z']:.1f} "
+                f"U={row['voltage']:+.4f}V w={row['airflow']:+.2f}m/s "
+                f"DL={row['dl_voltage']:+.4f}V"
+            )
+            self.listbox.yview_moveto(1)
+        self._ui_call(_insert)
 
     def export_csv(self):
-        if not self.data:
+        with self.data_lock:
+            rows = list(self.data)
+        if not rows:
             messagebox.showinfo("Export", "Keine Daten vorhanden!")
             return
-        df = pd.DataFrame(self.data)
+        df = pd.DataFrame(rows)
         dest = filedialog.asksaveasfilename(initialdir=self.save_dir.get(),defaultextension=".csv", filetypes=[("CSV","*.csv")])
         if dest:
             df.to_csv(dest, index=False)
             messagebox.showinfo("Export", f"Exportiert nach {dest}")
+
+    def on_close(self):
+        self.automatik_stop.set()
+        self.logger_stop.set()
+        self._stop_continuous_logger()
+        self.mot.close()
+        self.datalogger.close()
+        self.destroy()
 
 if __name__ == "__main__":
     MeasurementGUI().mainloop()
