@@ -27,6 +27,9 @@ def daq_voltage():
     return (adc_value - 2047.5) * (5/2047.5)
 
 class UsbDatalogger:
+    BURST_SAMPLES = 8
+    BURST_DELAY_S = 0.01
+
     def __init__(self, board_num=0, channel=0, ul_range=ULRange.BIP5VOLTS):
         self.board_num = board_num
         self.channel = channel
@@ -37,21 +40,26 @@ class UsbDatalogger:
 
     def raw_to_voltage(self, adc_value, n_bits=12, v_range=5):
         max_adc = (2 ** n_bits) - 1
-        return (adc_value - (max_adc / 2)) * (v_range / (max_adc / 2))
+        half_scale = max_adc / 2
+        return (adc_value - half_scale) * (v_range / half_scale)
 
     def read_once(self):
         raw = self.read_raw()
         voltage = self.raw_to_voltage(raw)
         return raw, voltage
 
-    def read_burst(self, samples=8, delay_s=0.01):
+    def read_burst(self, samples=BURST_SAMPLES, delay_s=BURST_DELAY_S):
         vals = []
+        last_raw = None
+        last_voltage = None
         for _ in range(max(1, samples)):
-            _, voltage = self.read_once()
+            raw, voltage = self.read_once()
+            last_raw = raw
+            last_voltage = voltage
             vals.append(voltage)
             if delay_s > 0:
                 time.sleep(delay_s)
-        return float(np.mean(vals))
+        return last_raw, last_voltage, float(np.mean(vals))
 
     def close(self):
         pass
@@ -129,6 +137,9 @@ class ToggleButton(ttk.Button):
         self.update_text()
 
 class MeasurementGUI(tk.Tk):
+    LOGGER_IDLE_SLEEP_S = 0.02
+    LOGGER_JOIN_TIMEOUT_S = 1.0
+
     def __init__(self):
         super().__init__()
         self.title("Strömungsmessung XY-Datalogger")
@@ -158,7 +169,7 @@ class MeasurementGUI(tk.Tk):
         self.logger_thread = None
         self.logger_stop = threading.Event()
         self.log_interval_s = 0.1
-        self.move_in_progress = False
+        self.move_in_progress_evt = threading.Event()
         self.target_lock = threading.Lock()
         self.current_target = (self.start_x.get(), self.start_y.get(), self.z_pos.get())
 
@@ -236,7 +247,7 @@ class MeasurementGUI(tk.Tk):
         if threading.current_thread() is threading.main_thread():
             fn(*args, **kwargs)
         else:
-            self.after(0, lambda: fn(*args, **kwargs))
+            self.after(0, lambda fn=fn, args=args, kwargs=kwargs: fn(*args, **kwargs))
 
     def _set_status(self, text):
         self._ui_call(self.status.set, text)
@@ -346,20 +357,24 @@ class MeasurementGUI(tk.Tk):
         self._set_target(x, y, self.z_pos.get())
         self.mot.send(f"ENABLE X"); self.mot.send(f"ENABLE Y")
         self.mot.send(f"GOTO X {s_x}"); self.mot.send(f"GOTO Y {s_y}")
-        self.move_in_progress = True
+        self.move_in_progress_evt.set()
         t_end = time.time() + timeout_s
+        act_x, act_y = None, None
         while time.time() < t_end:
             self.mot.send("POS?")
             act_x, act_y = self.mot.get_pos()
             if act_x is not None and abs(act_x-s_x)<3 and abs(act_y-s_y)<3:
-                self.move_in_progress = False
+                self.move_in_progress_evt.clear()
                 return True
             if self.automatik_stop.is_set(): 
-                self.move_in_progress = False
+                self.move_in_progress_evt.clear()
                 return False
             time.sleep(poll_s)
-        self.move_in_progress = False
-        self._set_status("Warnung: Zielposition nicht bestätigt (Timeout).")
+        self.move_in_progress_evt.clear()
+        self._set_status(
+            f"Warnung: Zielposition ({x:.1f}, {y:.1f}) nicht bestätigt "
+            f"(POS={act_x},{act_y}, Timeout)."
+        )
         return False
 
     def _start_continuous_logger(self):
@@ -372,12 +387,12 @@ class MeasurementGUI(tk.Tk):
     def _stop_continuous_logger(self):
         self.logger_stop.set()
         if self.logger_thread is not None and self.logger_thread.is_alive():
-            self.logger_thread.join(timeout=1.0)
+            self.logger_thread.join(timeout=self.LOGGER_JOIN_TIMEOUT_S)
 
     def _continuous_logger_worker(self):
         while not self.logger_stop.is_set() and not self.automatik_stop.is_set():
-            if not self.move_in_progress:
-                time.sleep(0.02)
+            if not self.move_in_progress_evt.is_set():
+                time.sleep(self.LOGGER_IDLE_SLEEP_S)
                 continue
             with self.target_lock:
                 x, y, z = self.current_target
@@ -431,7 +446,7 @@ class MeasurementGUI(tk.Tk):
             if not self.automatik_stop.is_set():
                 self._set_status("Messlauf abgeschlossen.")
         finally:
-            self.move_in_progress = False
+            self.move_in_progress_evt.clear()
             self._stop_continuous_logger()
             self._set_toggle_enabled(True)
             self.automatik_running = False
@@ -444,8 +459,7 @@ class MeasurementGUI(tk.Tk):
             voltage = daq_voltage()
             airflow = voltage_to_airflow(voltage)
             if burst:
-                dl_mean = self.datalogger.read_burst(samples=8, delay_s=0.01)
-                dl_raw, dl_voltage = self.datalogger.read_once()
+                dl_raw, dl_voltage, dl_mean = self.datalogger.read_burst()
             else:
                 dl_raw, dl_voltage = self.datalogger.read_once()
                 dl_mean = dl_voltage
